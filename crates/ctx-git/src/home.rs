@@ -29,7 +29,7 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> HomeError + '_ {
 /// Lines `.gitignore` must contain. `.machine` is critical: it names this
 /// machine's shard, and if it were committed a second machine would pull it
 /// and start writing into the first machine's shard (breaking invariant 3).
-const GITIGNORE_REQUIRED: &[&str] = &[".cache/", ".machine"];
+const GITIGNORE_REQUIRED: &[&str] = &[".cache/", ".machine", ".node/"];
 
 // `merge=union` is belt-and-braces: sharding already makes concurrent appends
 // land in different files, but if two clones of the same machine ever do touch
@@ -202,7 +202,7 @@ mod tests {
         assert!(!home.ensure().unwrap());
         assert_eq!(
             fs::read_to_string(home.root().join(".gitignore")).unwrap(),
-            "custom\n.cache/\n.machine\n",
+            "custom\n.cache/\n.machine\n.node/\n",
             "user lines kept, missing required lines appended"
         );
         let id = home.machine_id().unwrap();

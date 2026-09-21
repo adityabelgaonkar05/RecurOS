@@ -1,5 +1,7 @@
 /target
 node_modules/
+# Self-hosted relay identity and connector data; back it up privately, never commit it.
+/relay/data/
 # Per-user Claude Code settings (holds the ctx SessionStart hook)
 .claude/settings.local.json
 

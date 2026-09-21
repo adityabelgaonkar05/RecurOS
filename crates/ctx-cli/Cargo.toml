@@ -19,6 +19,7 @@ ctx-app.workspace = true
 ctx-mcp.workspace = true
 ctx-daemon.workspace = true
 ctx-wire.workspace = true
+ctx-relay.workspace = true
 anyhow.workspace = true
 arboard.workspace = true
 chrono.workspace = true

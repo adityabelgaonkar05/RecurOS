@@ -285,6 +285,12 @@ enum Command {
         #[arg(long, default_value = ctx_daemon::DEFAULT_ADDR)]
         addr: String,
     },
+    /// Pair and run the local context node used by remote MCP clients.
+    #[command(subcommand)]
+    Node(NodeCmd),
+    /// Initialise and run a self-hosted RecurOS relay.
+    #[command(subcommand)]
+    Relay(RelayCmd),
     /// Agent hook entry points (called by agents, not by you).
     #[command(subcommand, hide = true)]
     Hook(HookCmd),
@@ -363,6 +369,72 @@ enum ReviewCmd {
 enum DaemonCmd {
     /// Print the token to paste into the browser extension.
     Token,
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Pair this device with a relay using its one-time bootstrap code.
+    Login {
+        /// Public relay URL, for example https://ctx.example.com.
+        #[arg(long)]
+        relay: String,
+        /// One-time code printed by `ctx relay init`.
+        #[arg(long)]
+        code: String,
+    },
+    /// Keep this local context store available through its paired relay.
+    Start {
+        /// Replace the saved relay URL before connecting.
+        #[arg(long)]
+        relay: Option<String>,
+        /// Change the local context branch served to remote MCP clients.
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Show the paired relay and this device's public id.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum RelayCmd {
+    /// Create a relay data directory and print its one-time setup secrets.
+    Init {
+        /// Directory that holds the relay's small identity/routing database.
+        #[arg(long, default_value = "./recuros-relay")]
+        data: PathBuf,
+    },
+    /// Serve the relay. Put TLS/reverse proxying in front before public use.
+    Serve {
+        #[arg(long, default_value = "./recuros-relay")]
+        data: PathBuf,
+        #[arg(long, default_value = ctx_relay::DEFAULT_RELAY_ADDR)]
+        addr: String,
+    },
+    /// Create an additional revocable MCP connector secret.
+    Token {
+        #[arg(long, default_value = "./recuros-relay")]
+        data: PathBuf,
+        #[arg(long, default_value = "connector")]
+        label: String,
+    },
+    /// List or revoke devices enrolled with this relay.
+    #[command(subcommand)]
+    Device(RelayDeviceCmd),
+}
+
+#[derive(Subcommand)]
+enum RelayDeviceCmd {
+    /// List device ids and their active/revoked state.
+    Ls {
+        #[arg(long, default_value = "./recuros-relay")]
+        data: PathBuf,
+    },
+    /// Immediately deny future relayed requests to this device.
+    Revoke {
+        id: String,
+        #[arg(long, default_value = "./recuros-relay")]
+        data: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -864,6 +936,60 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 ctx_daemon::serve(app, &addr)?;
             }
         },
+        Command::Node(NodeCmd::Login { relay, code }) => {
+            let branch = open(&home)?.default_branch()?;
+            let device = ctx_relay::node_login(&home, &relay, &code, &branch)?;
+            println!("paired this device as {device}");
+            println!("it will serve branch {branch}");
+            println!("start it when remote MCP access is wanted: ctx node start");
+        }
+        Command::Node(NodeCmd::Start { relay, branch }) => {
+            ctx_relay::node_start(home, relay.as_deref(), branch.as_deref())?;
+        }
+        Command::Node(NodeCmd::Status) => match ctx_relay::node_status(&home)? {
+            Some((relay, device, branch)) => {
+                println!("paired relay: {relay}");
+                println!("device: {device}");
+                println!("serving branch: {branch}");
+                println!("start remote access: ctx node start");
+            }
+            None => println!(
+                "node is not paired; run `ctx node login --relay URL --code BOOTSTRAP_CODE`"
+            ),
+        },
+        Command::Relay(RelayCmd::Init { data }) => {
+            let init = ctx_relay::init(&data)?;
+            println!("relay initialised in {}", data.display());
+            println!(
+                "\nBootstrap code (shown only once; pair the first node with it):\n{}",
+                init.bootstrap_code
+            );
+            println!(
+                "\nConnector secret (shown only once; send it as Authorization: Bearer to /mcp):\n{}",
+                init.connector_secret
+            );
+            println!("\nRun: ctx relay serve --data {}", data.display());
+        }
+        Command::Relay(RelayCmd::Serve { data, addr }) => ctx_relay::serve(data, &addr)?,
+        Command::Relay(RelayCmd::Token { data, label }) => {
+            let secret = ctx_relay::create_connector_secret(&data, &label)?;
+            println!("connector secret (shown only once): {secret}");
+        }
+        Command::Relay(RelayCmd::Device(RelayDeviceCmd::Ls { data })) => {
+            let devices = ctx_relay::devices(&data)?;
+            if devices.is_empty() {
+                println!("no devices enrolled");
+            }
+            for device in devices {
+                let active = if device.active { "active" } else { "inactive" };
+                let revoked = if device.revoked { ", revoked" } else { "" };
+                println!("{}  {active}{revoked}", device.id);
+            }
+        }
+        Command::Relay(RelayCmd::Device(RelayDeviceCmd::Revoke { id, data })) => {
+            ctx_relay::revoke_device(&data, &id)?;
+            println!("revoked device {id}");
+        }
         Command::Hook(HookCmd::SessionStart) => session_start(&home)?,
     }
     Ok(ExitCode::SUCCESS)
@@ -1377,6 +1503,12 @@ fn status(home: &CtxHome) -> Result<()> {
         None => println!("repo     not bound (run `ctx init` in a project)"),
     }
     println!("branch   {}", app.default_branch()?);
+    match ctx_relay::node_status(home)? {
+        Some((relay, device, branch)) => println!("node     {device} via {relay} ({branch})"),
+        None => {
+            println!("node     not paired (optional: `ctx node login --relay URL --code CODE`)")
+        }
+    }
     println!("claims   {} total", stats.claims);
     for (k, n) in &stats.by_kind {
         println!("         {n:>5} {k}");

@@ -1,0 +1,7 @@
+.git
+target
+**/node_modules
+web/.next
+worker/.wrangler
+recuros-relay
+relay/data

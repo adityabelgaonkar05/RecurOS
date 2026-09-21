@@ -18,8 +18,8 @@ RecurOS fixes that. You tell any AI **"save that"**, and every other AI you use 
                                           and what you ruled out
 ```
 
-- **Free.** It runs on your computer. The optional cloud part fits in Cloudflare's free plan.
-- **Private.** Your notes live on your computer and in your own private GitHub repo. There's no RecurOS server and no account.
+- **Local-first.** Your context lives and is searched on your computer. A relay only reaches an online local node; it is not a context database.
+- **Self-hostable.** Run that relay yourself with Docker, without a GitHub repository or token.
 - **You stay in control.** Nothing is saved unless you ask, and you can delete anything.
 
 ---
@@ -31,12 +31,13 @@ RecurOS fixes that. You tell any AI **"save that"**, and every other AI you use 
 1. [A 2-minute example: building a notes app](#a-2-minute-example-building-a-notes-app)
 2. [Install](#1-install)
 3. [Use it with Claude Code (local only)](#2-use-it-with-claude-code-local-only)
-4. [Connect ChatGPT and claude.ai (optional, one-time)](#3-connect-chatgpt-and-claudeai-optional-one-time)
-5. [The full flow: idea to working app](#4-the-full-flow-idea-to-working-app)
-6. [What to say to your AI](#what-to-say-to-your-ai)
-7. [Troubleshooting](#troubleshooting)
-8. [FAQ](#faq)
-9. [How it works](#how-it-works)
+4. [Self-host a local node relay](#self-host-a-local-node-relay)
+5. [Connect ChatGPT and claude.ai through GitHub (legacy, optional)](#3-connect-chatgpt-and-claudeai-optional-one-time)
+6. [The full flow: idea to working app](#4-the-full-flow-idea-to-working-app)
+7. [What to say to your AI](#what-to-say-to-your-ai)
+8. [Troubleshooting](#troubleshooting)
+9. [FAQ](#faq)
+10. [How it works](#how-it-works)
 
 ---
 
@@ -166,7 +167,41 @@ Claude Code runs the right `ctx` commands itself; you don't need to learn them. 
 
 
 
-## 3. Connect ChatGPT and claude.ai (optional, one-time)
+## Self-host a local node relay
+
+Use this path when ChatGPT or claude.ai should reach context that stays on
+your computer. The relay gives the connector a stable public URL; your local
+`ctx` node makes an authenticated outbound connection to it. Claims,
+documents and packs are never stored by the relay.
+
+You need a public HTTPS address for the relay. Run it yourself with Docker:
+
+```sh
+cd relay
+docker compose run --rm --entrypoint ctx relay relay init --data /data
+docker compose up -d
+```
+
+The first command prints a one-time bootstrap code and connector secret.
+Put TLS in front of port 8788, then pair and start the device containing your
+context:
+
+```sh
+ctx node login --relay https://ctx.example.com --code <bootstrap-code>
+ctx node start
+```
+
+Configure your chat connector with URL `https://ctx.example.com/mcp` and an
+`Authorization: Bearer <connector-secret>` header. A path secret remains
+available for older clients, but headers keep the secret out of URLs and
+their logs.
+
+The local node must be running for remote requests to succeed. Full setup,
+device revocation and backup notes are in [relay/README.md](relay/README.md).
+
+---
+
+## 3. Connect ChatGPT and claude.ai through GitHub (legacy, optional)
 
 ChatGPT and claude.ai can't reach your computer, so they need a small "mailbox" in the cloud. You'll set up two free things, both owned by you:
 
@@ -449,12 +484,12 @@ ChatGPT and claude.ai (through the connector); Claude Code, Codex, Cursor and Ge
 For the curious (and for developers):
 
 ```
- ChatGPT / claude.ai ──► your Cloudflare Worker ──► your private GitHub repo ◄──► ctx on your computers
-                                                                                      │
-                                                         Claude Code, Codex, Cursor ◄─┘ (AGENTS.md + tools)
+ ChatGPT / claude.ai ──► your relay ──► your online local ctx node
+                                                 │
+                                  Claude Code, Codex, Cursor ◄─┘ (AGENTS.md + tools)
 ```
 
-- Every note is a small **claim** (a decision, fact, rule, rejected idea, open question or belief), stored in plain text files that are only ever added to, never edited. That's why syncing never conflicts and nothing is lost.
+- Every note is a small **claim** (a decision, fact, rule, rejected idea, open question or belief), stored locally in plain text files that are only ever added to, never edited.
 - Each idea has a **research** section (everything you explored) and a **code** section (only the conclusions a builder needs), so your coding agent gets a short, focused briefing instead of every brainstorm.
 - Briefings are **size-limited**: the coding agent gets the most useful ~700 tokens, chats get a fuller version, and handoff docs get everything.
 
@@ -462,7 +497,8 @@ Technical details:
 
 - `[docs/protocol.md](docs/protocol.md)`: every file format, rule and design decision, and why.
 - `[docs/canonical.md](docs/canonical.md)`: how notes are fingerprinted so they match across machines.
-- `[worker/README.md](worker/README.md)`: more detail on the Cloudflare Worker.
+- `[relay/README.md](relay/README.md)`: deploy the self-hosted relay.
+- `[worker/README.md](worker/README.md)`: the legacy GitHub-backed Worker path.
 
 
 
@@ -479,7 +515,7 @@ cd worker && npm ci && npm test   # the Cloudflare Worker
 | `crates/ctx-cli`                                                           | the `ctx` program                              |
 | `crates/ctx-app`                                                           | the operations every surface shares            |
 | `crates/ctx-core`, `ctx-store-sqlite`, `ctx-git`, `ctx-branch`, `ctx-pack` | storage, sync, branches, the briefing compiler |
-| `crates/ctx-mcp`, `ctx-daemon`, `ctx-wire`                                 | the AI tool connections                        |
+| `crates/ctx-mcp`, `ctx-daemon`, `ctx-wire`, `ctx-relay`                    | the AI tool connections and local-node relay   |
 | `worker/`                                                                  | the Cloudflare Worker (ChatGPT / claude.ai)    |
 | `extension/`                                                               | the browser extension (coming soon)            |
 

@@ -93,6 +93,38 @@ fn save_log_search_reindex_outside_a_project() {
 }
 
 #[test]
+fn relay_initialisation_prints_one_time_credentials_and_node_status_is_safe_unpaired() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("ctx");
+    let data = dir.path().join("relay");
+    let cwd = dir.path();
+
+    let status = ok(&ctx(&home, cwd, &["node", "status"]));
+    assert!(status.contains("node is not paired"), "{status}");
+
+    let data_arg = data.to_str().unwrap();
+    let initialised = ok(&ctx(&home, cwd, &["relay", "init", "--data", data_arg]));
+    assert!(initialised.contains("Bootstrap code"), "{initialised}");
+    assert!(initialised.contains("Connector secret"), "{initialised}");
+    assert!(
+        initialised.contains("Authorization: Bearer"),
+        "{initialised}"
+    );
+    assert!(data.join("relay.db").exists());
+
+    let token = ok(&ctx(
+        &home,
+        cwd,
+        &["relay", "token", "--data", data_arg, "--label", "test"],
+    ));
+    assert!(token.contains("rcm_"), "{token}");
+
+    let again = ctx(&home, cwd, &["relay", "init", "--data", data_arg]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already initialised"));
+}
+
+#[test]
 fn init_wires_a_repo_and_packs_follow_the_binding() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("ctx");
