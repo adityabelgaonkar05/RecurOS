@@ -78,7 +78,11 @@ function decode(value: string): Uint8Array {
 }
 
 function now(): number {
-  return Math.floor(Date.now() / 1000);
+    return Math.floor(Date.now() / 1000);
+}
+
+async function fingerprint(value: string): Promise<string> {
+  return encode(new Uint8Array(await crypto.subtle.digest("SHA-256", text.encode(value))));
 }
 
 function rpcError(payload: unknown, code: number, message: string): unknown {
@@ -177,7 +181,11 @@ export class RelayCoordinator extends DurableObject<Env> {
     if (!this.env.BOOTSTRAP_CODE || body.bootstrap_code !== this.env.BOOTSTRAP_CODE) {
       return json({ error: "bootstrap code is invalid or has already been used" }, 401);
     }
-    if (await this.ctx.storage.get<boolean>("bootstrap_used")) {
+    // A pairing code is one-use, but rotating the Worker secret deliberately
+    // opens one new pairing slot. This makes device recovery possible without
+    // deleting the Durable Object (and without ever storing the code itself).
+    const codeFingerprint = await fingerprint(this.env.BOOTSTRAP_CODE);
+    if ((await this.ctx.storage.get<string>("bootstrap_code_used")) === codeFingerprint) {
       return json({ error: "bootstrap code is invalid or has already been used" }, 401);
     }
     try {
@@ -189,7 +197,7 @@ export class RelayCoordinator extends DurableObject<Env> {
     }
     const deviceId = crypto.randomUUID();
     await this.ctx.storage.put(`device:${deviceId}`, { publicKey: body.public_key, revoked: false } satisfies Device);
-    await this.ctx.storage.put("bootstrap_used", true);
+    await this.ctx.storage.put("bootstrap_code_used", codeFingerprint);
     const signing = await this.signing();
     return json({ device_id: deviceId, relay_public_key: signing.publicKey });
   }

@@ -7,9 +7,9 @@ that runs `ctx node start`.
 ChatGPT / claude.ai → Worker + Durable Object → temporary HTTPS tunnel → local ctx node
 ```
 
-The Durable Object stores only a bootstrap-used flag, device public key,
-current tunnel URL and expiry, plus the relay signing key. It never stores
-claims, documents, project files, packs, or semantic indexes.
+The Durable Object stores only a hash of the last pairing code, device public
+keys, current tunnel URL and expiry, plus the relay signing key. It never
+stores claims, documents, project files, packs, or semantic indexes.
 
 ## Deploy
 
@@ -61,7 +61,8 @@ logs.
 ## Security model
 
 - The device creates an Ed25519 key pair locally. Its public key is enrolled
-  once with the bootstrap code.
+  once with the bootstrap code. Rotate that Worker secret to open one new
+  pairing slot for a replacement or additional device.
 - Every URL registration is signed by that device key and expires quickly.
 - Every Worker-to-node request is signed by a Worker key stored in the Durable
   Object. The node checks its signature, timestamp, and one-use nonce before
