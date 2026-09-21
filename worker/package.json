@@ -2,7 +2,7 @@
   "name": "recuros-worker",
   "version": "0.1.0",
   "private": true,
-  "description": "Stateless MCP connector that exposes a RecurOS store (a private GitHub repo) to claude.ai and ChatGPT",
+  "description": "Local-first RecurOS MCP relay for Cloudflare Workers",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

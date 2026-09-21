@@ -1,5 +1,4 @@
-//! A small, self-hostable MCP relay and the persistent outbound connection
-//! used by a local `ctx` node.
+//! A small, self-hostable MCP relay and its local HTTP executor.
 //!
 //! The relay deliberately stores routing and identity metadata only. Claims,
 //! documents and packs never cross its persistence boundary: a raw JSON-RPC
@@ -14,12 +13,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use axum::extract::ws::{Message as AxumMessage, WebSocket};
-use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
+use axum::body::Bytes;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,18 +26,18 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use mongodb::bson::{Document, doc};
 use mongodb::options::IndexOptions;
 use mongodb::{Client, Collection, Database, IndexModel};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc, oneshot};
-use tokio::time::timeout;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message as ClientMessage;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex as AsyncMutex;
 use ulid::Ulid;
+use url::{Host, Url};
 
 use ctx_app::App;
 use ctx_core::BranchRef;
@@ -49,6 +48,10 @@ const NODE_DIR: &str = ".node";
 const NODE_CONFIG: &str = "relay.json";
 const NODE_KEY: &str = "device.ed25519";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const NODE_REGISTRATION_TTL: Duration = Duration::from_secs(90);
+const NODE_HEARTBEAT: Duration = Duration::from_secs(30);
+const FORWARD_CLOCK_SKEW: i64 = 60;
+const RELAY_SIGNING_KEY_META: &str = "relay_signing_key";
 
 /// Values printed exactly once by `ctx relay init`.
 #[derive(Debug, Clone)]
@@ -177,8 +180,7 @@ pub fn devices_with_storage(data_dir: &Path, storage: RelayStorage) -> Result<Ve
     })
 }
 
-/// Serve the public relay. TLS belongs at the public reverse proxy; the node
-/// chooses `wss://` automatically when the configured relay URL is `https://`.
+/// Serve the public relay. TLS belongs at the public reverse proxy.
 pub fn serve(data_dir: PathBuf, addr: &str) -> Result<()> {
     serve_with_storage(data_dir, addr, RelayStorage::default())
 }
@@ -193,7 +195,7 @@ pub fn serve_with_storage(data_dir: PathBuf, addr: &str, storage: RelayStorage) 
     let result = rt.block_on(async move {
         let db = open_store(&data_dir, &storage).await?;
         db.require_initialised().await?;
-        let state = RelayState::new(db);
+        let state = RelayState::new(db.clone(), relay_signing_key(db.as_ref()).await?);
         let router = router(state);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -219,33 +221,37 @@ pub fn node_login(
     bootstrap_code: &str,
     branch: &BranchRef,
 ) -> Result<String> {
-    ensure_crypto_provider()?;
     let key = load_or_create_key(home)?;
     let relay_url = normalise_relay_url(relay_url)?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let device_id = rt.block_on(async {
-        let (mut ws, _) = connect_async(node_ws_url(&relay_url)?).await?;
-        send_client_wire(
-            &mut ws,
-            &Wire::Enroll {
+    let response = block_on(async {
+        let response = reqwest::Client::new()
+            .post(format!("{relay_url}/v1/node/enroll"))
+            .json(&EnrollRequest {
                 bootstrap_code: bootstrap_code.to_owned(),
                 public_key: encode_public_key(&key.verifying_key()),
-            },
-        )
-        .await?;
-        authenticate_node(&mut ws, &key).await
+            })
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!(
+                "relay rejected enrolment: {}",
+                response.text().await.unwrap_or_default()
+            )
+        }
+        Ok(response.json::<EnrollResponse>().await?)
     })?;
+    decode_public_key(&response.relay_public_key)
+        .context("relay returned an invalid signing key")?;
     save_node_config(
         home,
         &NodeConfig {
             relay_url,
-            device_id: device_id.clone(),
+            device_id: response.device_id.clone(),
+            relay_public_key: response.relay_public_key,
             branch: branch.to_string(),
         },
     )?;
-    Ok(device_id)
+    Ok(response.device_id)
 }
 
 /// Keep the local context node reachable by remote MCP clients. It owns the
@@ -254,8 +260,9 @@ pub fn node_start(
     home: CtxHome,
     relay_override: Option<&str>,
     branch_override: Option<&str>,
+    public_url: Option<&str>,
+    listen: &str,
 ) -> Result<()> {
-    ensure_crypto_provider()?;
     let mut config = load_node_config(&home)?.context(
         "node is not paired yet; run `ctx node login --relay URL --code BOOTSTRAP_CODE`",
     )?;
@@ -265,6 +272,9 @@ pub fn node_start(
     if let Some(branch) = branch_override {
         config.branch = BranchRef::new(branch)?.to_string();
     }
+    if config.relay_public_key.is_empty() {
+        bail!("this node was paired with the legacy relay protocol; run `ctx node login` again")
+    }
     if relay_override.is_some() || branch_override.is_some() {
         save_node_config(&home, &config)?;
     }
@@ -272,7 +282,7 @@ pub fn node_start(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_node(home, config, key))
+    rt.block_on(run_node(home, config, key, public_url, listen))
 }
 
 /// Report only non-sensitive node configuration for `ctx status` and users.
@@ -283,85 +293,67 @@ pub fn node_status(home: &CtxHome) -> Result<Option<(String, String, String)>> {
 #[derive(Clone)]
 struct RelayState {
     db: Arc<dyn RelayStore>,
-    nodes: Arc<RwLock<HashMap<String, NodeConnection>>>,
+    signing_key: Arc<SigningKey>,
+    client: reqwest::Client,
 }
 
 impl RelayState {
-    fn new(db: Arc<dyn RelayStore>) -> Self {
+    fn new(db: Arc<dyn RelayStore>, signing_key: SigningKey) -> Self {
         RelayState {
             db,
-            nodes: Arc::new(RwLock::new(HashMap::new())),
+            signing_key: Arc::new(signing_key),
+            client: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("valid relay HTTP client"),
         }
     }
 
-    async fn install_node(&self, user: String, node: NodeConnection) -> Option<NodeConnection> {
-        self.nodes.write().await.insert(user, node)
-    }
-
-    async fn remove_node(&self, user: &str, connection_id: &str) {
-        let mut nodes = self.nodes.write().await;
-        if nodes
-            .get(user)
-            .is_some_and(|node| node.connection_id == connection_id)
-        {
-            nodes.remove(user);
-        }
-    }
-
-    async fn forward(&self, user: &str, payload: Value) -> Result<Value, RelayError> {
-        let node = self
-            .nodes
-            .read()
-            .await
-            .get(user)
-            .cloned()
-            .ok_or(RelayError::NodeOffline)?;
-        if self
+    async fn forward(&self, user: &str, body: Vec<u8>) -> Result<Value, RelayError> {
+        let target = self
             .db
-            .device_user(&node.device_id)
+            .active_node(user)
             .await
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(user)
-        {
+            .map_err(RelayError::Storage)?;
+        let Some(target) = target.filter(|target| target.expires_at >= unix_seconds()) else {
             return Err(RelayError::NodeOffline);
-        }
-        let request_id = Ulid::new().to_string();
-        let (tx, rx) = oneshot::channel();
-        node.pending.lock().await.insert(request_id.clone(), tx);
-        let message = Wire::Request {
-            request_id: request_id.clone(),
-            payload,
         };
-        let message = text_message(&message).map_err(|_| RelayError::NodeOffline)?;
-        if node.tx.send(message).await.is_err() {
-            node.pending.lock().await.remove(&request_id);
+        let endpoint = node_execute_url(&target.url).map_err(RelayError::Other)?;
+        let timestamp = unix_seconds();
+        let nonce = URL_SAFE_NO_PAD.encode(random_bytes(16).map_err(RelayError::Other)?);
+        let signature =
+            self.signing_key
+                .sign(&forward_bytes(&target.device_id, timestamp, &nonce, &body));
+        let response = self
+            .client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .header("x-ctx-device", &target.device_id)
+            .header("x-ctx-timestamp", timestamp.to_string())
+            .header("x-ctx-nonce", &nonce)
+            .header(
+                "x-ctx-signature",
+                URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| RelayError::NodeOffline)?;
+        if !response.status().is_success() {
             return Err(RelayError::NodeOffline);
         }
-        match timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(_)) => Err(RelayError::NodeOffline),
-            Err(_) => {
-                node.pending.lock().await.remove(&request_id);
-                Err(RelayError::TimedOut)
-            }
-        }
+        response
+            .json::<Value>()
+            .await
+            .map_err(|_| RelayError::NodeOffline)
     }
-}
-
-#[derive(Clone)]
-struct NodeConnection {
-    connection_id: String,
-    device_id: String,
-    tx: mpsc::Sender<AxumMessage>,
-    pending: Arc<AsyncMutex<HashMap<String, oneshot::Sender<Value>>>>,
 }
 
 #[derive(Debug)]
 enum RelayError {
     NodeOffline,
-    TimedOut,
+    Storage(anyhow::Error),
+    Other(anyhow::Error),
 }
 
 impl RelayError {
@@ -370,7 +362,9 @@ impl RelayError {
             RelayError::NodeOffline => {
                 "The RecurOS node for this account is offline. Start `ctx node start` on the paired device."
             }
-            RelayError::TimedOut => "The RecurOS node did not answer before the relay timeout.",
+            RelayError::Storage(_) | RelayError::Other(_) => {
+                "The RecurOS relay could not reach the active node."
+            }
         }
     }
 }
@@ -378,7 +372,8 @@ impl RelayError {
 fn router(state: RelayState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
-        .route("/v1/node/connect", get(node_connect))
+        .route("/v1/node/enroll", post(node_enroll))
+        .route("/v1/node/register", post(node_register))
         .route("/mcp", post(mcp))
         // A path secret is retained for clients that cannot set headers. New
         // connector configurations should use `Authorization: Bearer …` on
@@ -391,28 +386,115 @@ async fn health() -> Json<Value> {
     Json(json!({"ok": true, "service": "recuros-relay", "version": ctx_app::VERSION}))
 }
 
-async fn node_connect(ws: WebSocketUpgrade, State(state): State<RelayState>) -> Response {
-    ws.on_upgrade(move |socket| serve_node_socket(socket, state))
+#[derive(Serialize, Deserialize)]
+struct EnrollRequest {
+    bootstrap_code: String,
+    public_key: String,
 }
 
-async fn mcp(
-    headers: HeaderMap,
+#[derive(Serialize, Deserialize)]
+struct EnrollResponse {
+    device_id: String,
+    relay_public_key: String,
+}
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    device_id: String,
+    public_url: String,
+    expires_at: i64,
+    signature: String,
+}
+
+async fn node_enroll(
     State(state): State<RelayState>,
-    Json(payload): Json<Value>,
+    Json(request): Json<EnrollRequest>,
 ) -> Response {
-    let secret = bearer_secret(&headers);
-    forward_mcp(state, secret, payload).await
+    let outcome = async {
+        let (device_id, _) = state
+            .db
+            .enrol(&request.bootstrap_code, &request.public_key)
+            .await?;
+        Ok::<_, anyhow::Error>(Json(EnrollResponse {
+            device_id,
+            relay_public_key: encode_public_key(&state.signing_key.verifying_key()),
+        }))
+    }
+    .await;
+    match outcome {
+        Ok(response) => response.into_response(),
+        Err(error) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn node_register(
+    State(state): State<RelayState>,
+    Json(request): Json<RegisterRequest>,
+) -> Response {
+    let outcome = async {
+        let public_url = normalise_public_node_url(&request.public_url)?;
+        let now = unix_seconds();
+        if request.expires_at <= now
+            || request.expires_at > now + NODE_REGISTRATION_TTL.as_secs() as i64 + 30
+        {
+            bail!("registration expiry must be within the next 120 seconds")
+        }
+        let public_key = state
+            .db
+            .device_key(&request.device_id)
+            .await?
+            .context("unknown or revoked device")?;
+        verify_registration(
+            &public_key,
+            &request.device_id,
+            &public_url,
+            request.expires_at,
+            &request.signature,
+        )?;
+        state
+            .db
+            .set_node_target(&request.device_id, &public_url, request.expires_at)
+            .await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(error) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn mcp(headers: HeaderMap, State(state): State<RelayState>, body: Bytes) -> Response {
+    forward_mcp(state, bearer_secret(&headers), body).await
 }
 
 async fn mcp_with_path_secret(
     AxumPath(secret): AxumPath<String>,
     State(state): State<RelayState>,
-    Json(payload): Json<Value>,
+    body: Bytes,
 ) -> Response {
-    forward_mcp(state, Some(secret.as_str()), payload).await
+    forward_mcp(state, Some(secret.as_str()), body).await
 }
 
-async fn forward_mcp(state: RelayState, secret: Option<&str>, payload: Value) -> Response {
+async fn forward_mcp(state: RelayState, secret: Option<&str>, body: Bytes) -> Response {
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(rpc_error(&Value::Null, -32700, "Invalid JSON-RPC body.")),
+            )
+                .into_response();
+        }
+    };
     let Some(secret) = secret else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -435,13 +517,18 @@ async fn forward_mcp(state: RelayState, secret: Option<&str>, payload: Value) ->
         )
             .into_response();
     };
-    match state.forward(&user, payload.clone()).await {
+    match state.forward(&user, body.to_vec()).await {
         Ok(response) => Json(response).into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(rpc_error(&payload, -32002, error.message())),
-        )
-            .into_response(),
+        Err(error) => {
+            if let RelayError::Storage(cause) | RelayError::Other(cause) = &error {
+                eprintln!("ctx relay: forwarding error: {cause:#}");
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(rpc_error(&payload, -32002, error.message())),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -471,184 +558,76 @@ fn rpc_error(payload: &Value, code: i64, message: &str) -> Value {
     })
 }
 
-async fn serve_node_socket(mut socket: WebSocket, state: RelayState) {
-    let outcome = async {
-        let first = recv_wire(&mut socket).await?;
-        let (device_id, public_key) = match first {
-            Wire::Enroll {
-                bootstrap_code,
-                public_key,
-            } => state.db.enrol(&bootstrap_code, &public_key).await?,
-            Wire::Hello { device_id } => {
-                let key = state
-                    .db
-                    .device_key(&device_id)
-                    .await?
-                    .context("unknown or revoked device")?;
-                (device_id, key)
-            }
-            _ => bail!("expected node hello or enrolment"),
-        };
-        let nonce = random_bytes(32)?;
-        send_wire(
-            &mut socket,
-            &Wire::Challenge {
-                device_id: device_id.clone(),
-                nonce: URL_SAFE_NO_PAD.encode(&nonce),
-            },
+async fn run_node(
+    home: CtxHome,
+    config: NodeConfig,
+    key: SigningKey,
+    supplied_url: Option<&str>,
+    listen: &str,
+) -> Result<()> {
+    let mut app = App::open(home, None)?;
+    app.set_active(&BranchRef::new(&config.branch)?)?;
+    let relay_key = decode_public_key(&config.relay_public_key)?;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding local node at {listen}"))?;
+    let local_addr = listener.local_addr()?;
+    if !local_addr.ip().is_loopback() {
+        bail!("the local node executor must bind a loopback address, not {local_addr}")
+    }
+    let executor = ExecutorState {
+        app: Arc::new(AsyncMutex::new(app)),
+        device_id: config.device_id.clone(),
+        relay_key,
+        used_nonces: Arc::new(AsyncMutex::new(HashMap::new())),
+    };
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/v1/execute", post(execute_local))
+                .with_state(executor),
         )
-        .await?;
-        let Wire::Authenticate { signature } = recv_wire(&mut socket).await? else {
-            bail!("expected node authentication")
-        };
-        verify_signature(&public_key, &device_id, &nonce, &signature)?;
-        let user = state
-            .db
-            .device_user(&device_id)
-            .await?
-            .context("unknown or revoked device")?;
-        state.db.set_active(&device_id).await?;
-        send_wire(
-            &mut socket,
-            &Wire::Ready {
-                device_id: device_id.clone(),
-            },
-        )
-        .await?;
-
-        let (mut writer, mut reader) = socket.split();
-        let (tx, mut rx) = mpsc::channel::<AxumMessage>(32);
-        let connection = NodeConnection {
-            connection_id: Ulid::new().to_string(),
-            device_id: device_id.clone(),
-            tx,
-            pending: Arc::new(AsyncMutex::new(HashMap::new())),
-        };
-        let connection_id = connection.connection_id.clone();
-        let previous = state.install_node(user.clone(), connection.clone()).await;
-        if let Some(previous) = previous {
-            fail_pending(
-                &previous,
-                json!({"error": "replaced by a newer node connection"}),
-            )
-            .await;
+        .await
+    });
+    let (public_url, mut tunnel) = match supplied_url {
+        Some(url) => (normalise_public_node_url(url)?, None),
+        None => {
+            let (child, url) = start_quick_tunnel(local_addr).await?;
+            eprintln!("ctx node: Cloudflare Quick Tunnel is {url}");
+            (url, Some(child))
         }
-        let write_task = tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                if writer.send(message).await.is_err() {
-                    break;
+    };
+    let result = async {
+        register_node(&config, &key, &public_url).await?;
+        eprintln!(
+            "ctx node: registered {public_url} with {}",
+            config.relay_url
+        );
+        let mut heartbeat = tokio::time::interval(NODE_HEARTBEAT);
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!("ctx node: stopping");
+                    return Ok(());
+                }
+                _ = heartbeat.tick() => {
+                    if let Some(child) = tunnel.as_mut()
+                        && child.try_wait()?.is_some() {
+                        bail!("cloudflared exited; start `ctx node start` again")
+                    }
+                    register_node(&config, &key, &public_url).await?;
                 }
             }
-        });
-        while let Some(frame) = reader.next().await {
-            let frame = frame?;
-            let AxumMessage::Text(text) = frame else {
-                continue;
-            };
-            let Wire::Response {
-                request_id,
-                payload,
-            } = serde_json::from_str::<Wire>(&text)?
-            else {
-                continue;
-            };
-            if let Some(waiter) = connection.pending.lock().await.remove(&request_id) {
-                let _ = waiter.send(payload);
-            }
         }
-        write_task.abort();
-        state.remove_node(&user, &connection_id).await;
-        fail_pending(&connection, json!({"error": "node disconnected"})).await;
-        Ok::<(), anyhow::Error>(())
     }
     .await;
-    if let Err(error) = outcome {
-        eprintln!("ctx relay: rejected node connection: {error:#}");
+    if let Some(mut child) = tunnel {
+        let _ = child.kill().await;
     }
-}
-
-async fn fail_pending(connection: &NodeConnection, payload: Value) {
-    let pending = std::mem::take(&mut *connection.pending.lock().await);
-    for (_, waiter) in pending {
-        let _ = waiter.send(payload.clone());
-    }
-}
-
-async fn run_node(home: CtxHome, config: NodeConfig, key: SigningKey) -> Result<()> {
-    let mut app = App::open(home, None)?;
-    let branch = BranchRef::new(&config.branch)?;
-    app.set_active(&branch)?;
-    loop {
-        match run_node_connection(&mut app, &config, &key).await {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                eprintln!("ctx node: relay connection ended ({error:#}); retrying in 3 seconds");
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        }
-    }
-}
-
-async fn run_node_connection(app: &mut App, config: &NodeConfig, key: &SigningKey) -> Result<()> {
-    let (mut ws, _) = connect_async(node_ws_url(&config.relay_url)?).await?;
-    send_client_wire(
-        &mut ws,
-        &Wire::Hello {
-            device_id: config.device_id.clone(),
-        },
-    )
-    .await?;
-    let authenticated = authenticate_node(&mut ws, key).await?;
-    if authenticated != config.device_id {
-        bail!("relay authenticated a different device")
-    }
-    eprintln!(
-        "ctx node: connected to {} as {}",
-        config.relay_url, config.device_id
-    );
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("ctx node: stopping");
-                return Ok(());
-            }
-            frame = ws.next() => {
-                let Some(frame) = frame else { bail!("relay closed the connection") };
-                let frame = frame?;
-                let ClientMessage::Text(text) = frame else { continue };
-                let Wire::Request { request_id, payload } = serde_json::from_str::<Wire>(&text)? else { continue };
-                let response = execute_mcp(app, payload);
-                send_client_wire(&mut ws, &Wire::Response { request_id, payload: response }).await?;
-            }
-        }
-    }
-}
-
-async fn authenticate_node<S>(socket: &mut S, key: &SigningKey) -> Result<String>
-where
-    S: futures_util::Sink<ClientMessage, Error = tokio_tungstenite::tungstenite::Error>
-        + futures_util::Stream<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
-{
-    let Wire::Challenge { device_id, nonce } = recv_client_wire(socket).await? else {
-        bail!("relay did not send a challenge")
-    };
-    let nonce = URL_SAFE_NO_PAD.decode(nonce.as_bytes())?;
-    let signature = key.sign(&auth_bytes(&device_id, &nonce));
-    send_client_wire(
-        socket,
-        &Wire::Authenticate {
-            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
-        },
-    )
-    .await?;
-    let Wire::Ready { device_id: ready } = recv_client_wire(socket).await? else {
-        bail!("relay did not accept the device")
-    };
-    if ready != device_id {
-        bail!("relay changed the challenged device id")
-    }
-    Ok(ready)
+    server.abort();
+    result
 }
 
 fn execute_mcp(app: &mut App, payload: Value) -> Value {
@@ -664,97 +643,209 @@ fn execute_mcp(app: &mut App, payload: Value) -> Value {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Wire {
-    Enroll {
-        bootstrap_code: String,
-        public_key: String,
-    },
-    Hello {
-        device_id: String,
-    },
-    Challenge {
-        device_id: String,
-        nonce: String,
-    },
-    Authenticate {
-        signature: String,
-    },
-    Ready {
-        device_id: String,
-    },
-    Request {
-        request_id: String,
-        payload: Value,
-    },
-    Response {
-        request_id: String,
-        payload: Value,
-    },
+#[derive(Clone)]
+struct ExecutorState {
+    app: Arc<AsyncMutex<App>>,
+    device_id: String,
+    relay_key: VerifyingKey,
+    used_nonces: Arc<AsyncMutex<HashMap<String, i64>>>,
 }
 
-async fn recv_wire(socket: &mut WebSocket) -> Result<Wire> {
-    let Some(frame) = socket.recv().await else {
-        bail!("connection closed")
+async fn execute_local(
+    headers: HeaderMap,
+    State(state): State<ExecutorState>,
+    body: Bytes,
+) -> Response {
+    if let Err(error) = verify_forward_request(&state, &headers, &body).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(rpc_error(&Value::Null, -32700, "Invalid JSON-RPC body.")),
+            )
+                .into_response();
+        }
     };
-    let AxumMessage::Text(text) = frame? else {
-        bail!("expected text websocket frame")
-    };
-    Ok(serde_json::from_str(&text)?)
+    Json(execute_mcp(&mut *state.app.lock().await, payload)).into_response()
 }
 
-async fn send_wire(socket: &mut WebSocket, wire: &Wire) -> Result<()> {
-    socket.send(text_message(wire)?).await?;
+async fn verify_forward_request(
+    state: &ExecutorState,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<()> {
+    let device = header(headers, "x-ctx-device")?;
+    if device != state.device_id {
+        bail!("request targets another device")
+    }
+    let timestamp: i64 = header(headers, "x-ctx-timestamp")?
+        .parse()
+        .context("invalid relay timestamp")?;
+    if (unix_seconds() - timestamp).abs() > FORWARD_CLOCK_SKEW {
+        bail!("relay request has expired")
+    }
+    let nonce = header(headers, "x-ctx-nonce")?;
+    if nonce.len() < 16 || URL_SAFE_NO_PAD.decode(nonce.as_bytes()).is_err() {
+        bail!("invalid relay nonce")
+    }
+    let signature = Signature::from_slice(
+        &URL_SAFE_NO_PAD.decode(header(headers, "x-ctx-signature")?.as_bytes())?,
+    )?;
+    state
+        .relay_key
+        .verify(&forward_bytes(device, timestamp, nonce, body), &signature)
+        .map_err(|_| anyhow!("invalid relay signature"))?;
+    let mut nonces = state.used_nonces.lock().await;
+    nonces.retain(|_, seen| *seen >= unix_seconds() - FORWARD_CLOCK_SKEW);
+    if nonces.insert(nonce.to_owned(), timestamp).is_some() {
+        bail!("replayed relay request")
+    }
     Ok(())
 }
 
-async fn recv_client_wire<S>(socket: &mut S) -> Result<Wire>
-where
-    S: futures_util::Stream<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
-{
-    let Some(frame) = socket.next().await else {
-        bail!("connection closed")
-    };
-    let ClientMessage::Text(text) = frame? else {
-        bail!("expected text websocket frame")
-    };
-    Ok(serde_json::from_str(&text)?)
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str> {
+    headers
+        .get(name)
+        .context(format!("missing {name}"))?
+        .to_str()
+        .context(format!("invalid {name}"))
 }
 
-async fn send_client_wire<S>(socket: &mut S, wire: &Wire) -> Result<()>
-where
-    S: futures_util::Sink<ClientMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
-    socket
-        .send(ClientMessage::Text(serde_json::to_string(wire)?.into()))
+#[derive(Serialize)]
+struct RegisterRequestOut<'a> {
+    device_id: &'a str,
+    public_url: &'a str,
+    expires_at: i64,
+    signature: String,
+}
+
+async fn register_node(config: &NodeConfig, key: &SigningKey, public_url: &str) -> Result<()> {
+    let expires_at = unix_seconds() + NODE_REGISTRATION_TTL.as_secs() as i64;
+    let signature = key.sign(&registration_bytes(
+        &config.device_id,
+        public_url,
+        expires_at,
+    ));
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/node/register", config.relay_url))
+        .json(&RegisterRequestOut {
+            device_id: &config.device_id,
+            public_url,
+            expires_at,
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        })
+        .send()
         .await?;
+    if !response.status().is_success() {
+        bail!(
+            "relay rejected node registration: {}",
+            response.text().await.unwrap_or_default()
+        )
+    }
     Ok(())
 }
 
-fn text_message(wire: &Wire) -> Result<AxumMessage> {
-    Ok(AxumMessage::Text(serde_json::to_string(wire)?.into()))
+async fn start_quick_tunnel(local_addr: std::net::SocketAddr) -> Result<(Child, String)> {
+    let mut child = Command::new("cloudflared")
+        .args(["tunnel", "--url", &format!("http://{local_addr}")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context(
+            "starting cloudflared; install it or pass --public-url for ngrok/a named tunnel",
+        )?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    if let Some(stream) = child.stdout.take() {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(line).await;
+            }
+        });
+    }
+    if let Some(stream) = child.stderr.take() {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(line).await;
+            }
+        });
+    }
+    drop(tx);
+    let url = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(line) = rx.recv().await {
+            if let Some(url) = quick_tunnel_url(&line) {
+                return Ok(url);
+            }
+        }
+        bail!("cloudflared exited before providing a tunnel URL")
+    })
+    .await
+    .context("waiting for a Cloudflare Quick Tunnel URL")??;
+    Ok((child, url))
 }
 
-fn verify_signature(
+fn quick_tunnel_url(line: &str) -> Option<String> {
+    let start = line.find("https://")?;
+    let raw = &line[start..];
+    let end = raw
+        .find(|ch: char| ch.is_whitespace() || ch == '"' || ch == '\\')
+        .unwrap_or(raw.len());
+    let candidate = &raw[..end];
+    if Url::parse(candidate)
+        .ok()?
+        .host_str()?
+        .ends_with(".trycloudflare.com")
+    {
+        normalise_public_node_url(candidate).ok()
+    } else {
+        None
+    }
+}
+
+fn verify_registration(
     public_key: &str,
     device_id: &str,
-    nonce: &[u8],
+    public_url: &str,
+    expires_at: i64,
     signature: &str,
 ) -> Result<()> {
-    let key = decode_public_key(public_key)?;
-    let signature = URL_SAFE_NO_PAD.decode(signature.as_bytes())?;
-    let signature = Signature::from_slice(&signature)?;
-    key.verify(&auth_bytes(device_id, nonce), &signature)
-        .map_err(|_| anyhow!("invalid device signature"))
+    let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature.as_bytes())?)?;
+    decode_public_key(public_key)?
+        .verify(
+            &registration_bytes(device_id, public_url, expires_at),
+            &signature,
+        )
+        .map_err(|_| anyhow!("invalid device registration signature"))
 }
 
-fn auth_bytes(device_id: &str, nonce: &[u8]) -> Vec<u8> {
-    let mut out = b"recuros-node-auth-v1\0".to_vec();
+fn registration_bytes(device_id: &str, public_url: &str, expires_at: i64) -> Vec<u8> {
+    let mut out = b"recuros-node-register-v1\0".to_vec();
     out.extend_from_slice(device_id.as_bytes());
     out.push(0);
-    out.extend_from_slice(nonce);
+    out.extend_from_slice(public_url.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    out
+}
+
+fn forward_bytes(device_id: &str, timestamp: i64, nonce: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = b"recuros-node-forward-v1\0".to_vec();
+    out.extend_from_slice(device_id.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&timestamp.to_be_bytes());
+    out.extend_from_slice(nonce.as_bytes());
+    out.push(0);
+    out.extend_from_slice(blake3::hash(body).as_bytes());
     out
 }
 
@@ -774,6 +865,8 @@ fn decode_public_key(value: &str) -> Result<VerifyingKey> {
 struct NodeConfig {
     relay_url: String,
     device_id: String,
+    #[serde(default)]
+    relay_public_key: String,
     #[serde(default = "default_node_branch")]
     branch: String,
 }
@@ -855,36 +948,51 @@ fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
 }
 
 fn normalise_relay_url(raw: &str) -> Result<String> {
-    let url = raw.trim().trim_end_matches('/');
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    let url = Url::parse(raw.trim()).context("relay URL must be a valid URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         bail!("relay URL must start with http:// or https://")
     }
-    Ok(url.to_owned())
+    Ok(raw.trim().trim_end_matches('/').to_owned())
 }
 
-fn node_ws_url(relay_url: &str) -> Result<String> {
-    let ws = relay_url
-        .strip_prefix("https://")
-        .map(|rest| format!("wss://{rest}"))
-        .or_else(|| {
-            relay_url
-                .strip_prefix("http://")
-                .map(|rest| format!("ws://{rest}"))
-        })
-        .context("relay URL must start with http:// or https://")?;
-    Ok(format!("{ws}/v1/node/connect"))
-}
-
-/// `rustls` 0.23 deliberately makes the cryptographic implementation an
-/// application choice. Explicitly selecting ring keeps `wss://` node
-/// connections working even when another dependency changes Rustls defaults.
-fn ensure_crypto_provider() -> Result<()> {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .map_err(|_| anyhow!("could not install the Rustls crypto provider"))?;
+fn normalise_public_node_url(raw: &str) -> Result<String> {
+    let mut url = Url::parse(raw.trim()).context("public node URL must be a valid HTTPS URL")?;
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("public node URL must be a plain HTTPS URL")
     }
-    Ok(())
+    match url.host() {
+        Some(Host::Domain(host)) if !host.eq_ignore_ascii_case("localhost") => {}
+        _ => {
+            bail!("public node URL must use a public DNS hostname, not an IP address or localhost")
+        }
+    }
+    if url.path() != "/" && !url.path().is_empty() {
+        bail!("public node URL must not include a path")
+    }
+    url.set_path("/");
+    Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+fn node_execute_url(node_url: &str) -> Result<Url> {
+    let base = Url::parse(node_url).context("registered node URL is invalid")?;
+    base.join("v1/execute")
+        .context("registered node URL cannot be used")
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn random_bytes(n: usize) -> Result<Vec<u8>> {
@@ -915,9 +1023,17 @@ trait RelayStore: Send + Sync {
     async fn enrol(&self, code: &str, public_key: &str) -> Result<(String, String)>;
     async fn device_key(&self, device_id: &str) -> Result<Option<String>>;
     async fn device_user(&self, device_id: &str) -> Result<Option<String>>;
-    async fn set_active(&self, device_id: &str) -> Result<()>;
+    async fn set_node_target(&self, device_id: &str, url: &str, expires_at: i64) -> Result<()>;
+    async fn active_node(&self, user: &str) -> Result<Option<NodeTarget>>;
     async fn revoke_device(&self, device_id: &str) -> Result<bool>;
     async fn devices(&self) -> Result<Vec<DeviceInfo>>;
+}
+
+#[derive(Debug, Clone)]
+struct NodeTarget {
+    device_id: String,
+    url: String,
+    expires_at: i64,
 }
 
 async fn open_store(data_dir: &Path, storage: &RelayStorage) -> Result<Arc<dyn RelayStore>> {
@@ -955,6 +1071,14 @@ async fn initialise_store(store: &dyn RelayStore, data_dir: &Path) -> Result<Rel
         .set_meta("bootstrap_hash", &hash_secret(&bootstrap_code))
         .await?;
     store.set_meta("bootstrap_used", "false").await?;
+    let signing_key =
+        SigningKey::from_bytes(&random_bytes(32)?.try_into().expect("32 bytes requested"));
+    store
+        .set_meta(
+            RELAY_SIGNING_KEY_META,
+            &URL_SAFE_NO_PAD.encode(signing_key.to_bytes()),
+        )
+        .await?;
     store
         .insert_connector(&connector_secret, "owner", "initial connector")
         .await?;
@@ -962,6 +1086,23 @@ async fn initialise_store(store: &dyn RelayStore, data_dir: &Path) -> Result<Rel
         bootstrap_code,
         connector_secret,
     })
+}
+
+async fn relay_signing_key(store: &dyn RelayStore) -> Result<SigningKey> {
+    if let Some(saved) = store.meta(RELAY_SIGNING_KEY_META).await? {
+        let bytes: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(saved.as_bytes())?
+            .try_into()
+            .map_err(|_| anyhow!("relay signing key has the wrong length"))?;
+        return Ok(SigningKey::from_bytes(&bytes));
+    }
+    // A relay created by a pre-HTTP release gains a signing key lazily. The
+    // first node must pair again to learn its public half.
+    let bytes: [u8; 32] = random_bytes(32)?.try_into().expect("32 bytes requested");
+    store
+        .set_meta(RELAY_SIGNING_KEY_META, &URL_SAFE_NO_PAD.encode(bytes))
+        .await?;
+    Ok(SigningKey::from_bytes(&bytes))
 }
 
 #[derive(Clone)]
@@ -993,6 +1134,7 @@ impl RelayStore for SqliteRelayStore {
             CREATE TABLE IF NOT EXISTS devices (
               id TEXT PRIMARY KEY, user_id TEXT NOT NULL, public_key TEXT NOT NULL UNIQUE,
               revoked INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 0,
+              node_url TEXT, node_expires_at INTEGER,
               created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS connector_tokens (
@@ -1002,6 +1144,17 @@ impl RelayStore for SqliteRelayStore {
             CREATE INDEX IF NOT EXISTS devices_active ON devices(user_id, active);
             ",
         )?;
+        let connection = self.connection()?;
+        let columns = connection
+            .prepare("PRAGMA table_info(devices)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "node_url") {
+            connection.execute("ALTER TABLE devices ADD COLUMN node_url TEXT", [])?;
+        }
+        if !columns.iter().any(|column| column == "node_expires_at") {
+            connection.execute("ALTER TABLE devices ADD COLUMN node_expires_at INTEGER", [])?;
+        }
         Ok(())
     }
 
@@ -1116,21 +1269,32 @@ impl RelayStore for SqliteRelayStore {
             .optional()?)
     }
 
-    async fn set_active(&self, device_id: &str) -> Result<()> {
+    async fn set_node_target(&self, device_id: &str, url: &str, expires_at: i64) -> Result<()> {
         let user: String = self.connection()?.query_row(
             "SELECT user_id FROM devices WHERE id = ? AND revoked = 0",
             [device_id],
             |row| row.get(0),
         )?;
         let conn = self.connection()?;
-        conn.execute("UPDATE devices SET active = 0 WHERE user_id = ?", [user])?;
-        conn.execute("UPDATE devices SET active = 1 WHERE id = ?", [device_id])?;
+        conn.execute("UPDATE devices SET active = 0, node_url = NULL, node_expires_at = NULL WHERE user_id = ?", [user])?;
+        conn.execute(
+            "UPDATE devices SET active = 1, node_url = ?, node_expires_at = ? WHERE id = ?",
+            params![url, expires_at, device_id],
+        )?;
         Ok(())
+    }
+
+    async fn active_node(&self, user: &str) -> Result<Option<NodeTarget>> {
+        Ok(self.connection()?.query_row(
+            "SELECT id, node_url, node_expires_at FROM devices WHERE user_id = ? AND revoked = 0 AND active = 1 AND node_url IS NOT NULL AND node_expires_at IS NOT NULL",
+            [user],
+            |row| Ok(NodeTarget { device_id: row.get(0)?, url: row.get(1)?, expires_at: row.get(2)? }),
+        ).optional()?)
     }
 
     async fn revoke_device(&self, device_id: &str) -> Result<bool> {
         let changed = self.connection()?.execute(
-            "UPDATE devices SET revoked = 1, active = 0 WHERE id = ? AND revoked = 0",
+            "UPDATE devices SET revoked = 1, active = 0, node_url = NULL, node_expires_at = NULL WHERE id = ? AND revoked = 0",
             [device_id],
         )?;
         Ok(changed > 0)
@@ -1172,6 +1336,8 @@ struct MemoryDevice {
     public_key: String,
     revoked: bool,
     active: bool,
+    node_url: Option<String>,
+    node_expires_at: Option<i64>,
     created_at: String,
 }
 
@@ -1256,6 +1422,8 @@ impl RelayStore for MemoryRelayStore {
                 public_key: public_key.clone(),
                 revoked: false,
                 active: false,
+                node_url: None,
+                node_expires_at: None,
                 created_at: Ulid::new().to_string(),
             },
         );
@@ -1283,7 +1451,7 @@ impl RelayStore for MemoryRelayStore {
             .map(|device| device.user_id.clone()))
     }
 
-    async fn set_active(&self, device_id: &str) -> Result<()> {
+    async fn set_node_target(&self, device_id: &str, url: &str, expires_at: i64) -> Result<()> {
         let mut state = self.lock()?;
         let user = state
             .devices
@@ -1294,6 +1462,8 @@ impl RelayStore for MemoryRelayStore {
         for device in state.devices.values_mut() {
             if device.user_id == user {
                 device.active = false;
+                device.node_url = None;
+                device.node_expires_at = None;
             }
         }
         state
@@ -1301,7 +1471,26 @@ impl RelayStore for MemoryRelayStore {
             .get_mut(device_id)
             .expect("device was checked above")
             .active = true;
+        let device = state
+            .devices
+            .get_mut(device_id)
+            .expect("device was checked above");
+        device.node_url = Some(url.to_owned());
+        device.node_expires_at = Some(expires_at);
         Ok(())
+    }
+
+    async fn active_node(&self, user: &str) -> Result<Option<NodeTarget>> {
+        Ok(self.lock()?.devices.iter().find_map(|(id, device)| {
+            if device.revoked || !device.active || device.user_id != user {
+                return None;
+            }
+            Some(NodeTarget {
+                device_id: id.clone(),
+                url: device.node_url.clone()?,
+                expires_at: device.node_expires_at?,
+            })
+        }))
     }
 
     async fn revoke_device(&self, device_id: &str) -> Result<bool> {
@@ -1314,6 +1503,8 @@ impl RelayStore for MemoryRelayStore {
         }
         device.revoked = true;
         device.active = false;
+        device.node_url = None;
+        device.node_expires_at = None;
         Ok(true)
     }
 
@@ -1501,21 +1692,36 @@ impl RelayStore for MongoRelayStore {
             .transpose()
     }
 
-    async fn set_active(&self, device_id: &str) -> Result<()> {
+    async fn set_node_target(&self, device_id: &str, url: &str, expires_at: i64) -> Result<()> {
         let user = self
             .device_user(device_id)
             .await?
             .context("unknown or revoked device")?;
         self.devices_collection()
-            .update_many(doc! {"user_id": &user}, doc! {"$set": {"active": false}})
+            .update_many(
+                doc! {"user_id": &user},
+                doc! {"$set": {"active": false}, "$unset": {"node_url": "", "node_expires_at": ""}},
+            )
             .await?;
         self.devices_collection()
             .update_one(
                 doc! {"_id": device_id, "revoked": false},
-                doc! {"$set": {"active": true}},
+                doc! {"$set": {"active": true, "node_url": url, "node_expires_at": expires_at}},
             )
             .await?;
         Ok(())
+    }
+
+    async fn active_node(&self, user: &str) -> Result<Option<NodeTarget>> {
+        self.devices_collection()
+            .find_one(doc! {"user_id": user, "revoked": false, "active": true, "node_url": {"$exists": true}, "node_expires_at": {"$exists": true}})
+            .await?
+            .map(|document| Ok(NodeTarget {
+                device_id: mongo_string(&document, "_id")?,
+                url: mongo_string(&document, "node_url")?,
+                expires_at: document.get_i64("node_expires_at").map_err(|_| anyhow!("MongoDB relay record has no integer `node_expires_at` field"))?,
+            }))
+            .transpose()
     }
 
     async fn revoke_device(&self, device_id: &str) -> Result<bool> {
@@ -1523,7 +1729,7 @@ impl RelayStore for MongoRelayStore {
             .devices_collection()
             .update_one(
                 doc! {"_id": device_id, "revoked": false},
-                doc! {"$set": {"revoked": true, "active": false}},
+                doc! {"$set": {"revoked": true, "active": false}, "$unset": {"node_url": "", "node_expires_at": ""}},
             )
             .await?;
         Ok(result.modified_count != 0)
@@ -1629,23 +1835,29 @@ mod tests {
     }
 
     #[test]
-    fn only_the_enrolled_private_key_can_answer_a_challenge() {
+    fn only_the_enrolled_private_key_can_register_a_url() {
         let key = SigningKey::from_bytes(&[8; 32]);
-        let nonce = [3; 32];
         let device = "01J00000000000000000000000";
-        let signature = URL_SAFE_NO_PAD.encode(key.sign(&auth_bytes(device, &nonce)).to_bytes());
-        verify_signature(
+        let url = "https://random.trycloudflare.com";
+        let expiry = 1234;
+        let signature = URL_SAFE_NO_PAD.encode(
+            key.sign(&registration_bytes(device, url, expiry))
+                .to_bytes(),
+        );
+        verify_registration(
             &encode_public_key(&key.verifying_key()),
             device,
-            &nonce,
+            url,
+            expiry,
             &signature,
         )
         .unwrap();
         assert!(
-            verify_signature(
+            verify_registration(
                 &encode_public_key(&key.verifying_key()),
                 "other",
-                &nonce,
+                url,
+                expiry,
                 &signature
             )
             .is_err()
@@ -1653,15 +1865,17 @@ mod tests {
     }
 
     #[test]
-    fn relay_and_websocket_urls_follow_the_public_scheme() {
+    fn relay_and_node_urls_are_validated() {
         assert_eq!(
-            node_ws_url("https://relay.example").unwrap(),
-            "wss://relay.example/v1/node/connect"
+            normalise_relay_url("https://relay.example/").unwrap(),
+            "https://relay.example"
         );
         assert_eq!(
-            node_ws_url("http://127.0.0.1:8788").unwrap(),
-            "ws://127.0.0.1:8788/v1/node/connect"
+            normalise_public_node_url("https://node.example/").unwrap(),
+            "https://node.example"
         );
+        assert!(normalise_public_node_url("http://node.example").is_err());
+        assert!(normalise_public_node_url("https://127.0.0.1").is_err());
     }
 
     #[test]
@@ -1680,6 +1894,7 @@ mod tests {
         let config = NodeConfig {
             relay_url: "https://relay.example".into(),
             device_id: "device".into(),
+            relay_public_key: "relay-key".into(),
             branch: "project/code".into(),
         };
         save_node_config(&home, &config).unwrap();
@@ -1690,7 +1905,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_endpoint_rejects_missing_and_invalid_connector_credentials() {
         let (store, init) = initialised_memory_store().await;
-        let relay = router(RelayState::new(store));
+        let relay = router(RelayState::new(store, SigningKey::from_bytes(&[3; 32])));
 
         let (status, body) = http_json(&relay, mcp_request("/mcp", None, 1)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1714,152 +1929,108 @@ mod tests {
         assert_eq!(body["error"]["code"], -32002);
     }
 
-    #[tokio::test]
-    async fn authenticated_node_receives_and_answers_relay_requests() {
-        let (store, init) = initialised_memory_store().await;
-        let state = RelayState::new(store);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server_state = state.clone();
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, router(server_state)).await;
-        });
+    async fn signed_test_node(
+        State(key): State<VerifyingKey>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let device = header(&headers, "x-ctx-device").unwrap();
+        let timestamp: i64 = header(&headers, "x-ctx-timestamp")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let nonce = header(&headers, "x-ctx-nonce").unwrap();
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(header(&headers, "x-ctx-signature").unwrap().as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        key.verify(&forward_bytes(device, timestamp, nonce, &body), &signature)
+            .unwrap();
+        Json(json!({"forwarded": serde_json::from_slice::<Value>(&body).unwrap()["id"]}))
+            .into_response()
+    }
 
-        let signing_key = SigningKey::from_bytes(&[9; 32]);
-        let (mut node, _) = connect_async(format!("ws://{address}/v1/node/connect"))
+    #[tokio::test]
+    async fn registered_http_node_receives_a_signed_mcp_request() {
+        let (store, init) = initialised_memory_store().await;
+        let device_key = SigningKey::from_bytes(&[11; 32]);
+        let (device, _) = store
+            .enrol(
+                &init.bootstrap_code,
+                &encode_public_key(&device_key.verifying_key()),
+            )
             .await
             .unwrap();
-        send_client_wire(
-            &mut node,
-            &Wire::Enroll {
-                bootstrap_code: init.bootstrap_code,
-                public_key: encode_public_key(&signing_key.verifying_key()),
-            },
-        )
-        .await
-        .unwrap();
-        authenticate_node(&mut node, &signing_key).await.unwrap();
-
-        for _ in 0..20 {
-            if state.nodes.read().await.contains_key("owner") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(state.nodes.read().await.contains_key("owner"));
-
-        let responder = tokio::spawn(async move {
-            let frame = node.next().await.unwrap().unwrap();
-            let ClientMessage::Text(text) = frame else {
-                panic!("relay sent a non-text request")
-            };
-            let Wire::Request {
-                request_id,
-                payload,
-            } = serde_json::from_str::<Wire>(&text).unwrap()
-            else {
-                panic!("relay sent the wrong envelope")
-            };
-            send_client_wire(
-                &mut node,
-                &Wire::Response {
-                    request_id,
-                    payload: json!({"echo": payload}),
-                },
+        let relay_key = SigningKey::from_bytes(&[12; 32]);
+        let node_relay_key = relay_key.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/execute", post(signed_test_node))
+                    .with_state(node_relay_key.verifying_key()),
             )
             .await
             .unwrap();
         });
-
-        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
-        let response = state.forward("owner", request.clone()).await.unwrap();
-        assert_eq!(response, json!({"echo": request}));
-        responder.await.unwrap();
+        store
+            .set_node_target(&device, &format!("http://{address}"), unix_seconds() + 60)
+            .await
+            .unwrap();
+        let relay = router(RelayState::new(store, relay_key));
+        let (status, body) = http_json(
+            &relay,
+            mcp_request("/mcp", Some(&init.connector_secret), 42),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"forwarded": 42}));
         server.abort();
     }
 
     #[tokio::test]
-    async fn http_mcp_forwards_over_an_authenticated_node_and_honours_revocation() {
+    async fn registration_endpoint_requires_a_valid_device_signature_and_activates_target() {
         let (store, init) = initialised_memory_store().await;
-        let state = RelayState::new(store);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server_state = state.clone();
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, router(server_state)).await;
-        });
-
-        let signing_key = SigningKey::from_bytes(&[10; 32]);
-        let (mut node, _) = connect_async(format!("ws://{address}/v1/node/connect"))
+        let device_key = SigningKey::from_bytes(&[13; 32]);
+        let (device, _) = store
+            .enrol(
+                &init.bootstrap_code,
+                &encode_public_key(&device_key.verifying_key()),
+            )
             .await
             .unwrap();
-        send_client_wire(
-            &mut node,
-            &Wire::Enroll {
-                bootstrap_code: init.bootstrap_code.clone(),
-                public_key: encode_public_key(&signing_key.verifying_key()),
-            },
-        )
-        .await
-        .unwrap();
-        let device_id = authenticate_node(&mut node, &signing_key).await.unwrap();
-        for _ in 0..20 {
-            if state.nodes.read().await.contains_key("owner") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        let responder = tokio::spawn(async move {
-            for _ in 0..2 {
-                let ClientMessage::Text(text) = node.next().await.unwrap().unwrap() else {
-                    panic!("relay sent a non-text request")
-                };
-                let Wire::Request {
-                    request_id,
-                    payload,
-                } = serde_json::from_str::<Wire>(&text).unwrap()
-                else {
-                    panic!("relay sent the wrong envelope")
-                };
-                send_client_wire(
-                    &mut node,
-                    &Wire::Response {
-                        request_id,
-                        payload: json!({"ok": payload["id"]}),
-                    },
-                )
-                .await
-                .unwrap();
-            }
-        });
-
-        let relay = router(state.clone());
-        let (status, body) =
-            http_json(&relay, mcp_request("/mcp", Some(&init.connector_secret), 7)).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({"ok": 7}));
-
-        let (status, body) = http_json(
-            &relay,
-            mcp_request(&format!("/mcp/{}", init.connector_secret), None, 8),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({"ok": 8}));
-        responder.await.unwrap();
-
-        assert!(state.db.revoke_device(&device_id).await.unwrap());
-        let (status, body) =
-            http_json(&relay, mcp_request("/mcp", Some(&init.connector_secret), 9)).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["code"], -32002);
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("offline")
+        let relay = router(RelayState::new(
+            store.clone(),
+            SigningKey::from_bytes(&[14; 32]),
+        ));
+        let url = "https://node.trycloudflare.com";
+        let expiry = unix_seconds() + 60;
+        let signature = URL_SAFE_NO_PAD.encode(
+            device_key
+                .sign(&registration_bytes(&device, url, expiry))
+                .to_bytes(),
         );
-        server.abort();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/node/register")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"device_id": device, "public_url": url, "expires_at": expiry, "signature": signature}).to_string()))
+            .unwrap();
+        let (status, body) = http_json(&relay, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(store.active_node("owner").await.unwrap().unwrap().url, url);
+
+        let invalid = Request::builder()
+            .method("POST")
+            .uri("/v1/node/register")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"device_id": device, "public_url": "https://attacker.example", "expires_at": expiry, "signature": signature}).to_string()))
+            .unwrap();
+        let (status, _) = http_json(&relay, invalid).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }

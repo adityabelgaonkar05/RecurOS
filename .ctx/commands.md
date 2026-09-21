@@ -57,7 +57,7 @@ RecurOS does. The user does not need to know these commands. Rules:
 | run that relay | `ctx relay serve --data ./recuros-relay --addr 0.0.0.0:8788` |
 | see or revoke a paired device | `ctx relay device ls` / `ctx relay device revoke <id>` |
 | pair this device with it | `ctx node login --relay https://ctx.example.com --code <bootstrap-code>` |
-| make local context available to chat MCP clients | `ctx node start` (or `ctx node start --branch project/code` to switch its served branch) |
+| make local context available to chat MCP clients | `ctx node start` (uses a Quick Tunnel; use `--public-url https://...` for ngrok/named tunnels) |
 | see this device's pairing | `ctx node status` |
 
 The relay holds only device identity and live routing state. Claims and

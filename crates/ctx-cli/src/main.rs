@@ -384,12 +384,19 @@ enum NodeCmd {
     },
     /// Keep this local context store available through its paired relay.
     Start {
-        /// Replace the saved relay URL before connecting.
+        /// Replace the saved stable relay URL.
         #[arg(long)]
         relay: Option<String>,
         /// Change the local context branch served to remote MCP clients.
         #[arg(long)]
         branch: Option<String>,
+        /// Existing public HTTPS URL (for example an ngrok or named Cloudflare tunnel).
+        /// When omitted, ctx starts a Cloudflare Quick Tunnel automatically.
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Loopback address for the local executor.
+        #[arg(long, default_value = "127.0.0.1:8790")]
+        listen: String,
     },
     /// Show the paired relay and this device's public id.
     Status,
@@ -972,8 +979,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("it will serve branch {branch}");
             println!("start it when remote MCP access is wanted: ctx node start");
         }
-        Command::Node(NodeCmd::Start { relay, branch }) => {
-            ctx_relay::node_start(home, relay.as_deref(), branch.as_deref())?;
+        Command::Node(NodeCmd::Start {
+            relay,
+            branch,
+            public_url,
+            listen,
+        }) => {
+            ctx_relay::node_start(
+                home,
+                relay.as_deref(),
+                branch.as_deref(),
+                public_url.as_deref(),
+                &listen,
+            )?;
         }
         Command::Node(NodeCmd::Status) => match ctx_relay::node_status(&home)? {
             Some((relay, device, branch)) => {

@@ -20,13 +20,13 @@ ed25519-dalek.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 mongodb.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
 ulid.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

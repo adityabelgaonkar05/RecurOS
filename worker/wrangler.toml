@@ -1,12 +1,17 @@
 name = "recuros"
-main = "src/index.ts"
+main = "src/local-relay.ts"
 compatibility_date = "2025-09-01"
 
-# Non-secret configuration. Secrets (GITHUB_TOKEN, CTX_SECRET) are set with
-# `npx wrangler secret put <NAME>` and never live in this file.
-[vars]
-GITHUB_REPO = "OWNER/REPO"   # the private repo holding your ~/ctx
-GITHUB_BRANCH = "main"
+# Secrets (CTX_SECRET, BOOTSTRAP_CODE) are set with `npx wrangler secret put`
+# and never live in this file. This Worker stores no context data.
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "RelayCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayCoordinator"]
 
 # Request budget guard. The Workers Free plan allows 100,000 requests/day and
 # never bills: requests over the limit simply fail until the daily reset.

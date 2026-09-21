@@ -171,8 +171,8 @@ Claude Code runs the right `ctx` commands itself; you don't need to learn them. 
 
 Use this path when ChatGPT or claude.ai should reach context that stays on
 your computer. The relay gives the connector a stable public URL; your local
-`ctx` node makes an authenticated outbound connection to it. Claims,
-documents and packs are never stored by the relay.
+`ctx` node registers a temporary tunnel URL with it. Claims, documents and
+packs are never stored by the relay.
 
 You need a public HTTPS address for the relay. Run it yourself with Docker:
 
@@ -197,6 +197,11 @@ ctx node login --relay https://ctx.example.com --code <bootstrap-code>
 ctx node start
 ```
 
+`ctx node start` starts a loopback executor and a Cloudflare Quick Tunnel,
+then renews the generated URL with the relay. To use a named Cloudflare Tunnel
+or ngrok instead, start that tunnel for port 8790 and run
+`ctx node start --public-url https://your-tunnel.example`.
+
 Configure your chat connector with URL `https://ctx.example.com/mcp` and an
 `Authorization: Bearer <connector-secret>` header. A path secret remains
 available for older clients, but headers keep the secret out of URLs and
@@ -204,6 +209,11 @@ their logs.
 
 The local node must be running for remote requests to succeed. Full setup,
 device revocation and backup notes are in [relay/README.md](relay/README.md).
+
+If you prefer a serverless fixed endpoint, the bundled
+[Cloudflare Worker relay](worker/README.md) provides the same protocol with a
+Durable Object holding only device/routing metadata. It does not use GitHub or
+store context data.
 
 ---
 

@@ -56,9 +56,22 @@ ctx node login --relay https://ctx.example.com --code <bootstrap-code>
 ctx node start
 ```
 
-`ctx node start` opens an outbound authenticated connection, so the computer
-does not need an inbound port, a Cloudflare account, GitHub, or a tunnel URL.
-Stop it and remote MCP calls return an explicit offline error.
+`ctx node start` serves only `127.0.0.1:8790`, starts a Cloudflare Quick
+Tunnel, and signs the generated URL into the relay every 30 seconds. The
+relay signs every request before posting it through that URL; the local node
+rejects unsigned, expired, or replayed requests. The computer needs no
+inbound port, Cloudflare account, or GitHub token. Stop it and remote MCP
+calls return an explicit offline error.
+
+For a named Cloudflare Tunnel, ngrok, or another HTTPS tunnel, point it at
+`127.0.0.1:8790` and pass its public address instead of starting Quick Tunnel:
+
+```sh
+ctx node start --public-url https://your-tunnel.example
+```
+
+The relay accepts only public HTTPS DNS hostnames for registrations. Never
+expose the loopback executor directly.
 
 Pairing from a repository makes its bound branch the remote default. To serve
 a different branch later, use `ctx node start --branch project/branch`.
