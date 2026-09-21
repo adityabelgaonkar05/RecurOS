@@ -53,6 +53,7 @@ RecurOS does. The user does not need to know these commands. Rules:
 | The user wants to | Run |
 |---|---|
 | initialise a self-hosted relay | `ctx relay init --data ./recuros-relay` |
+| use MongoDB for relay metadata | set `MONGODB_URL` before every relay command (optional `MONGODB_DATABASE`; SQLite is the durable default) |
 | run that relay | `ctx relay serve --data ./recuros-relay --addr 0.0.0.0:8788` |
 | see or revoke a paired device | `ctx relay device ls` / `ctx relay device revoke <id>` |
 | pair this device with it | `ctx node login --relay https://ctx.example.com --code <bootstrap-code>` |

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ctx_app::{App, PackOpts, SaveOutcome, VerifyResult, first_line};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -402,6 +402,8 @@ enum RelayCmd {
         /// Directory that holds the relay's small identity/routing database.
         #[arg(long, default_value = "./recuros-relay")]
         data: PathBuf,
+        #[command(flatten)]
+        storage: RelayStoreArgs,
     },
     /// Serve the relay. Put TLS/reverse proxying in front before public use.
     Serve {
@@ -409,6 +411,8 @@ enum RelayCmd {
         data: PathBuf,
         #[arg(long, default_value = ctx_relay::DEFAULT_RELAY_ADDR)]
         addr: String,
+        #[command(flatten)]
+        storage: RelayStoreArgs,
     },
     /// Create an additional revocable MCP connector secret.
     Token {
@@ -416,6 +420,8 @@ enum RelayCmd {
         data: PathBuf,
         #[arg(long, default_value = "connector")]
         label: String,
+        #[command(flatten)]
+        storage: RelayStoreArgs,
     },
     /// List or revoke devices enrolled with this relay.
     #[command(subcommand)]
@@ -428,13 +434,36 @@ enum RelayDeviceCmd {
     Ls {
         #[arg(long, default_value = "./recuros-relay")]
         data: PathBuf,
+        #[command(flatten)]
+        storage: RelayStoreArgs,
     },
     /// Immediately deny future relayed requests to this device.
     Revoke {
         id: String,
         #[arg(long, default_value = "./recuros-relay")]
         data: PathBuf,
+        #[command(flatten)]
+        storage: RelayStoreArgs,
     },
+}
+
+#[derive(Args, Clone)]
+struct RelayStoreArgs {
+    /// MongoDB connection URL for relay metadata. Defaults to MONGODB_URL.
+    #[arg(long)]
+    mongodb_url: Option<String>,
+    /// MongoDB database name (default: recuros_relay; or MONGODB_DATABASE).
+    #[arg(long)]
+    mongodb_database: Option<String>,
+}
+
+impl RelayStoreArgs {
+    fn storage(&self) -> ctx_relay::RelayStorage {
+        ctx_relay::RelayStorage::from_environment(
+            self.mongodb_url.clone(),
+            self.mongodb_database.clone(),
+        )
+    }
 }
 
 #[derive(Subcommand)]
@@ -957,8 +986,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 "node is not paired; run `ctx node login --relay URL --code BOOTSTRAP_CODE`"
             ),
         },
-        Command::Relay(RelayCmd::Init { data }) => {
-            let init = ctx_relay::init(&data)?;
+        Command::Relay(RelayCmd::Init { data, storage }) => {
+            let relay_storage = storage.storage();
+            let uses_mongodb = relay_storage.mongodb_url.is_some();
+            let init = ctx_relay::init_with_storage(&data, relay_storage)?;
             println!("relay initialised in {}", data.display());
             println!(
                 "\nBootstrap code (shown only once; pair the first node with it):\n{}",
@@ -968,15 +999,31 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 "\nConnector secret (shown only once; send it as Authorization: Bearer to /mcp):\n{}",
                 init.connector_secret
             );
-            println!("\nRun: ctx relay serve --data {}", data.display());
+            if uses_mongodb {
+                println!(
+                    "\nKeep the same MONGODB_URL (and MONGODB_DATABASE, if set), then run: ctx relay serve --data {}",
+                    data.display()
+                );
+            } else {
+                println!("\nRun: ctx relay serve --data {}", data.display());
+            }
         }
-        Command::Relay(RelayCmd::Serve { data, addr }) => ctx_relay::serve(data, &addr)?,
-        Command::Relay(RelayCmd::Token { data, label }) => {
-            let secret = ctx_relay::create_connector_secret(&data, &label)?;
+        Command::Relay(RelayCmd::Serve {
+            data,
+            addr,
+            storage,
+        }) => ctx_relay::serve_with_storage(data, &addr, storage.storage())?,
+        Command::Relay(RelayCmd::Token {
+            data,
+            label,
+            storage,
+        }) => {
+            let secret =
+                ctx_relay::create_connector_secret_with_storage(&data, &label, storage.storage())?;
             println!("connector secret (shown only once): {secret}");
         }
-        Command::Relay(RelayCmd::Device(RelayDeviceCmd::Ls { data })) => {
-            let devices = ctx_relay::devices(&data)?;
+        Command::Relay(RelayCmd::Device(RelayDeviceCmd::Ls { data, storage })) => {
+            let devices = ctx_relay::devices_with_storage(&data, storage.storage())?;
             if devices.is_empty() {
                 println!("no devices enrolled");
             }
@@ -986,8 +1033,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{}  {active}{revoked}", device.id);
             }
         }
-        Command::Relay(RelayCmd::Device(RelayDeviceCmd::Revoke { id, data })) => {
-            ctx_relay::revoke_device(&data, &id)?;
+        Command::Relay(RelayCmd::Device(RelayDeviceCmd::Revoke { id, data, storage })) => {
+            ctx_relay::revoke_device_with_storage(&data, &id, storage.storage())?;
             println!("revoked device {id}");
         }
         Command::Hook(HookCmd::SessionStart) => session_start(&home)?,

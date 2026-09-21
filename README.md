@@ -182,6 +182,12 @@ docker compose run --rm --entrypoint ctx relay relay init --data /data
 docker compose up -d
 ```
 
+This defaults to a small SQLite file under `relay/data`. To store only the
+relay's identity/device metadata in MongoDB instead, set `MONGODB_URL` (and
+optionally `MONGODB_DATABASE=recuros_relay`) before both `relay init` and
+`docker compose up`. Context claims, documents and indexes remain local; full
+MongoDB setup notes are in [relay/README.md](relay/README.md).
+
 The first command prints a one-time bootstrap code and connector secret.
 Put TLS in front of port 8788, then pair and start the device containing your
 context:

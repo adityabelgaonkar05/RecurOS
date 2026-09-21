@@ -7,4 +7,9 @@ services:
       - "8788:8788"
     volumes:
       - ./data:/data
+    environment:
+      # Set MONGODB_URL in the shell or an adjacent .env file to move relay
+      # identity/device metadata into MongoDB. Empty means local SQLite.
+      MONGODB_URL: ${MONGODB_URL:-}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-recuros_relay}
     restart: unless-stopped
